@@ -342,6 +342,16 @@ rel_improve = st.sidebar.slider("ML must beat BASE by at least (relative)", 0.00
 decay = st.sidebar.slider("Recency decay (per week)", 0.90, 0.999, 0.97, 0.001,
                           help="Lower = more weight on recent weeks; higher = more uniform.")
 
+# --- limit to top-N (only for Customer × Item) ---
+topN = None
+if agg_level == "Customer × Item":
+    topN = st.sidebar.slider(
+        "Limit to top-N Customer×Item series (by total qty Jan–Aug)",
+        min_value=50, max_value=2000, value=300, step=50,
+        help="Keeps the biggest series so the app runs fast. Raise later after testing."
+    )
+
+
 st.title("Weekly Forecast — BASE / ML / BEST (September 2025)")
 
 if not uploaded:
@@ -353,6 +363,20 @@ if not uploaded:
 # ----------------------------
 base_df = load_base_excel(uploaded)
 wk_full = build_weekly(base_df, SERIES_COLS)
+
+# --- fast mode filter (only applies in Customer × Item mode) ---
+if topN is not None and SERIES_COLS == ["Customer Group", "Itemcode"]:
+    totals = (
+        wk_full.groupby(SERIES_COLS, as_index=False)["qty"]
+               .sum()
+               .sort_values("qty", ascending=False)
+               .head(int(topN))[SERIES_COLS]
+    )
+    before = wk_full[SERIES_COLS].drop_duplicates().shape[0]
+    wk_full = wk_full.merge(totals, on=SERIES_COLS, how="inner")
+    after = wk_full[SERIES_COLS].drop_duplicates().shape[0]
+    st.info(f"Fast mode: training on top {after}/{before} Customer×Item series (by total qty).")
+
 if wk_full.empty:
     st.error("No rows after filtering (UOM='CS' & Jan–Aug 2025). Check the file.")
     st.stop()
