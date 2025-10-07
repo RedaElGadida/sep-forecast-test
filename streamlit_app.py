@@ -1,4 +1,4 @@
-# streamlit_app.py — OPTIMIZED VERSION
+# streamlit_app.py — CORRECTED VERSION
 import io
 from typing import Dict, List, Tuple
 
@@ -152,7 +152,7 @@ def add_lags_rolls_calendar_vectorized(
 # ----------------------------
 def run_global_model_pipeline(
     X: pd.DataFrame, feat_cols: List[str], series_cols: List[str], decay: float
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Trains a single global model, runs an August backtest, and generates a September forecast.
     """
@@ -198,7 +198,10 @@ def run_global_model_pipeline(
     # Baseline predictions (rolling 4-week mean)
     val_df["pred_base"] = val_df["rollmean_4"]
     # ML predictions
-    val_df["pred_ml"] = np.expm1(model.predict(val_df[feat_cols + series_cols])).clip(lower=0)
+    # >>> BUG FIX: Use np.clip(array, min, max) syntax <<<
+    ml_predictions_val = np.expm1(model.predict(val_df[feat_cols + series_cols]))
+    val_df["pred_ml"] = np.clip(ml_predictions_val, 0, None)
+
 
     # Calculate WAPE by series
     def get_wape(g, col):
@@ -226,8 +229,10 @@ def run_global_model_pipeline(
     for week_start in SEPT_WEEKS:
         # Create features for the current week
         latest_features = add_lags_rolls_calendar_vectorized(hist_df, series_cols)
-        current_week_feats = latest_features[latest_features["week_start"] == week_start.normalize() - pd.DateOffset(weeks=1)].copy()
-        current_week_feats['week_start'] = week_start
+        # We need the features from the *last known week* to predict the *next* week
+        last_known_week = week_start.normalize() - pd.DateOffset(weeks=1)
+        current_week_feats = latest_features[latest_features["week_start"] == last_known_week].copy()
+        current_week_feats['week_start'] = week_start # Update timestamp to the week we are forecasting
 
         # Baseline Prediction
         base_pred = current_week_feats['rollmean_4'].fillna(current_week_feats['lag1']).fillna(0)
@@ -236,7 +241,9 @@ def run_global_model_pipeline(
         for c in categorical_features:
             current_week_feats[c] = current_week_feats[c].astype('category').cat.set_categories(X[c].cat.categories)
 
-        ml_pred = np.expm1(model.predict(current_week_feats[feat_cols + series_cols])).clip(lower=0)
+        # >>> BUG FIX: Use np.clip(array, min, max) syntax <<<
+        ml_pred_raw = np.expm1(model.predict(current_week_feats[feat_cols + series_cols]))
+        ml_pred = np.clip(ml_pred_raw, 0, None)
 
         # Store predictions
         week_preds_base = current_week_feats[series_cols + ["week_start"]].copy()
@@ -576,3 +583,4 @@ except Exception as e:
     )
     st.exception(e)
     st.stop()
+
