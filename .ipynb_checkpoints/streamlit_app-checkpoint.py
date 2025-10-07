@@ -28,28 +28,82 @@ def monday_week_start(s: pd.Series) -> pd.Series:
 
 @st.cache_data(show_spinner=False)
 def load_base_excel(file) -> pd.DataFrame:
-    """Read only the needed columns from 'Base' and normalize names/types (faster)."""
-    def _need(col):
-        n = str(col).replace("\u00A0"," ").strip().upper().replace("-","").replace("_","")
-        base = {"Customer Group","Itemcode","UOM","Delivery Date","Quantity"}
-        return (str(col) in base) or (n in {"P9","P09","PERIOD9"})  # keep P-9 for monthly compare
-    df = pd.read_excel(file, sheet_name="Base", header=4, usecols=_need)
+    """
+    Robust loader:
+    - Reads the full 'Base' sheet
+    - Auto-detects/matches common aliases for required columns
+    - Renames to canonical names we use downstream
+    """
+    def norm(s):
+        return (
+            str(s).replace("\u00A0", " ")
+                  .strip().upper()
+                  .replace(" ", "")
+                  .replace("-", "")
+                  .replace("_", "")
+        )
 
-    # normalize column names if needed
-    if "Customer Group" not in df.columns:
-        for alt in ["Corporate Customer","Customer","CustomerGroup"]:
-            if alt in df.columns: df = df.rename(columns={alt:"Customer Group"}); break
-    if "Itemcode" not in df.columns:
-        for alt in ["Item Code","Item","SKU","Item Code "]:
-            if alt in df.columns: df = df.rename(columns={alt:"Itemcode"}); break
+    # Read whole sheet (don’t pre-filter columns to avoid dropping aliases)
+    raw = pd.read_excel(file, sheet_name="Base", header=4)
+    cols_norm = {c: norm(c) for c in raw.columns}
 
-    # clean types
+    # helper to pick first column whose normalized name is in a set
+    def pick(candidates: set[str]) -> str | None:
+        for c, n in cols_norm.items():
+            if n in candidates:
+                return c
+        return None
+
+    # detect required columns (broad aliases)
+    cust_col = pick({"CUSTOMERGROUP", "CORPORATECUSTOMER", "CUSTOMER", "CUSTOMERNAME"})
+    item_col = pick({"ITEMCODE", "ITEM", "SKU", "ITEMNUMBER", "ITEMNO"})
+    uom_col  = pick({"UOM", "UNITOFMEASURE"})
+    date_col = pick({"DELIVERYDATE", "DATE", "SHIPDATE", "INVOICEDATE"})
+    qty_col  = pick({"QUANTITY", "QTY", "ORDERQTY", "SHIPQTY"})
+
+    missing = [name for name, val in {
+        "Customer Group": cust_col,
+        "Itemcode": item_col,
+        "UOM": uom_col,
+        "Delivery Date": date_col,
+        "Quantity": qty_col,
+    }.items() if val is None]
+
+    if missing:
+        st.error(
+            "❌ The uploaded Excel’s **Base** sheet is missing required columns "
+            f"(or they’re named differently): {missing}\n\n"
+            f"Available columns: {list(raw.columns)}"
+        )
+        st.stop()
+
+    # keep P-9 (S&OP Sept) if present
+    p9_col = pick({"P9", "P09", "PERIOD9"})
+    keep = [cust_col, item_col, uom_col, date_col, qty_col] + ([p9_col] if p9_col else [])
+
+    df = raw[keep].copy().rename(columns={
+        cust_col: "Customer Group",
+        item_col: "Itemcode",
+        uom_col:  "UOM",
+        date_col: "Delivery Date",
+        qty_col:  "Quantity",
+    })
+
+    # clean types/values
     df["UOM"] = df["UOM"].astype(str).str.replace("\u00A0"," ", regex=False).str.strip().str.upper()
     df["Delivery Date"] = pd.to_datetime(df["Delivery Date"], errors="coerce")
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
     df["Customer Group"] = df["Customer Group"].astype(str)
     df["Itemcode"] = df["Itemcode"].astype(str)
+
+    # quick visibility of what was mapped
+    st.caption(
+        f"Mapped columns → Customer Group: '{cust_col}', Itemcode: '{item_col}', "
+        f"UOM: '{uom_col}', Date: '{date_col}', Qty: '{qty_col}'"
+        + (f", P-9: '{p9_col}'" if p9_col else "")
+    )
     return df
+
 
 def build_weekly(df: pd.DataFrame, series_cols: List[str]) -> pd.DataFrame:
     """Aggregate to weekly by series, complete missing weeks with zeros."""
