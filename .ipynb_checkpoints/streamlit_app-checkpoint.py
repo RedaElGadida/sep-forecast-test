@@ -354,10 +354,6 @@ if agg_level == "Customer × Item":
     topN_items = st.sidebar.slider("Limit to top-N Customer×Item (by total qty Jan–Aug)",
                                    50, 2000, 300, 50)
 
-topN_cust = None
-if agg_level == "Customer":
-    topN_cust = st.sidebar.slider("Limit to top-N customers (by total qty Jan–Aug)",
-                                  30, 300, 120, 30)
 
 st.title("Weekly Forecast — BASE / ML / BEST (September 2025)")
 if not uploaded:
@@ -383,14 +379,7 @@ try:
             after = wk_full[SERIES_COLS].drop_duplicates().shape[0]
             st.info(f"Fast mode: top {after}/{before} Customer×Item series.")
 
-        if topN_cust is not None and SERIES_COLS == ["Customer Group"]:
-            keep = (wk_full.groupby("Customer Group", as_index=False)["qty"].sum()
-                             .sort_values("qty", ascending=False).head(int(topN_cust))["Customer Group"])
-            before = wk_full["Customer Group"].nunique()
-            wk_full = wk_full[wk_full["Customer Group"].isin(keep)]
-            after = wk_full["Customer Group"].nunique()
-            st.info(f"Fast mode: top {after}/{before} customers.")
-
+        
         st.info(f"Series: {wk_full[SERIES_COLS].drop_duplicates().shape[0]} | "
                 f"Weeks: {wk_full['week_start'].nunique()} | Rows: {len(wk_full):,}")
 
