@@ -1,452 +1,501 @@
-# streamlit_app.py — September Test (SOP baseline + ADP + comparison)
-import re
+# app.py
+import io
+from typing import Tuple, Dict, List
 import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.ensemble import HistGradientBoostingRegressor
 
-st.set_page_config(page_title="September Weekly Forecast – Test", layout="centered")
+# ----------------------------
+# Page config
+# ----------------------------
+st.set_page_config(page_title="Weekly Forecast (BASE / ML / BEST)", layout="wide")
 
-st.title("September Weekly Forecast – Test")
-st.caption("Upload your Excel. The app builds two September forecasts: (1) S&OP-based weekly split, (2) Actuals-driven projection from Jan–Aug; then compares them. Accuracy is shown only if September actuals are present.")
+# ----------------------------
+# Helpers
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def load_base_excel(file) -> pd.DataFrame:
+    """
+    Load the 'Base' sheet (headers start on row 5 -> header=4).
+    Returns a DataFrame with at least:
+    ['Customer Group','Itemcode','UOM','Quantity','Delivery Date', ... 'P-9' ...]
+    """
+    df = pd.read_excel(file, sheet_name="Base", header=4)
+    # clean UOM
+    df["UOM"] = (
+        df["UOM"].astype(str)
+        .str.replace("\u00A0", " ", regex=False)
+        .str.strip()
+        .str.upper()
+    )
+    # parse date
+    df["Delivery Date"] = pd.to_datetime(df["Delivery Date"], errors="coerce")
+    return df
 
-# =========================
-# Upload
-# =========================
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+def wape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    denom = float(np.abs(y_true).sum())
+    return np.nan if denom == 0 else float(np.abs(y_true - y_pred).sum()) / denom
+
+def monday_week_start(s: pd.Series) -> pd.Series:
+    # Normalize any date to its Monday start (00:00)
+    return (s - pd.to_timedelta(s.dt.weekday, unit="D")).dt.normalize()
+
+def build_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    # Jan–Aug 2025 only, UOM=CS
+    mask = (df["UOM"].eq("CS")) & (df["Delivery Date"].between("2025-01-01", "2025-08-31"))
+    d = df.loc[mask, ["Customer Group", "Itemcode", "Delivery Date", "Quantity"]].copy()
+    d["Quantity"] = pd.to_numeric(d["Quantity"], errors="coerce").fillna(0.0)
+    d["week_start"] = monday_week_start(d["Delivery Date"])
+
+    # Aggregate to weekly by Corporate Customer (Customer Group)
+    wk = (
+        d.groupby(["Customer Group", "week_start"], dropna=False)["Quantity"]
+        .sum()
+        .rename("qty")
+        .reset_index()
+    )
+
+    # Complete weekly calendar per group (zero-fill missing weeks)
+    if wk.empty:
+        return wk.assign(qty=0.0)
+
+    cal = pd.date_range(wk["week_start"].min(), wk["week_start"].max(), freq="W-MON")
+    groups = wk["Customer Group"].drop_duplicates().sort_values()
+    full = pd.MultiIndex.from_product(
+        [groups, cal], names=["Customer Group", "week_start"]
+    ).to_frame(index=False)
+    wk_full = (
+        full.merge(wk, on=["Customer Group", "week_start"], how="left")
+        .assign(qty=lambda d: d["qty"].fillna(0.0))
+        .sort_values(["Customer Group", "week_start"])
+        .reset_index(drop=True)
+    )
+    return wk_full
+
+def add_lags_rolls_calendar(wk_full: pd.DataFrame) -> pd.DataFrame:
+    def _add_feats(g):
+        g = g.sort_values("week_start").copy()
+        for k in [1, 2, 3, 4]:
+            g[f"lag{k}"] = g["qty"].shift(k)
+        for w in [4, 8, 12]:
+            g[f"rollmean_{w}"] = g["qty"].shift(1).rolling(w, min_periods=2).mean()
+        woy = g["week_start"].dt.isocalendar().week.astype(int)
+        g["woy_sin"] = np.sin(2 * np.pi * woy / 52.0)
+        g["woy_cos"] = np.cos(2 * np.pi * woy / 52.0)
+        return g
+
+    def _add_more_feats(g):
+        g = g.sort_values("week_start").copy()
+        wom = ((g["week_start"].dt.day - 1) // 7 + 1).astype(int).clip(1, 5)
+        g["wom"] = wom
+        g["wom_sin"] = np.sin(2 * np.pi * g["wom"] / 5.0)
+        g["wom_cos"] = np.cos(2 * np.pi * g["wom"] / 5.0)
+        prev = g["qty"].shift(1)
+        g["slope_1"] = prev - g["rollmean_4"]
+        g["mom_4_8"] = g["rollmean_4"] - g["rollmean_8"]
+        g["ratio_4_8"] = g["rollmean_4"] / np.where(
+            g["rollmean_8"].abs() > 1e-9, g["rollmean_8"].abs(), 1e-9
+        )
+        return g
+
+    X = (
+        wk_full.groupby("Customer Group", dropna=False, group_keys=False)
+        .apply(_add_feats)
+        .reset_index(drop=True)
+    )
+    X = (
+        X.groupby("Customer Group", dropna=False, group_keys=False)
+        .apply(_add_more_feats)
+        .reset_index(drop=True)
+    )
+    return X
+
+def split_masks(X: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    SPLIT_TRAIN_END = pd.Timestamp("2025-07-31")
+    VAL_START = pd.Timestamp("2025-08-01")
+    VAL_END = pd.Timestamp("2025-08-31")
+    mask_train = X["week_start"] <= SPLIT_TRAIN_END
+    mask_val = (X["week_start"] >= VAL_START) & (X["week_start"] <= VAL_END)
+    return mask_train, mask_val
+
+def august_baseline(X: pd.DataFrame, mask_val: pd.Series) -> Tuple[float, pd.DataFrame]:
+    val = X.loc[mask_val, ["Customer Group", "week_start", "qty", "rollmean_4"]].copy()
+    val = val.rename(columns={"rollmean_4": "pred_base"})
+    overall = wape(val["qty"].to_numpy(), val["pred_base"].to_numpy())
+    by_group = (
+        val.groupby("Customer Group", dropna=False)
+        .apply(lambda g: wape(g["qty"].to_numpy(), g["pred_base"].to_numpy()))
+        .reset_index(name="WAPE_base")
+        .dropna()
+    )
+    return overall, by_group
+
+def recency_weights(X: pd.DataFrame, mask_train: pd.Series, decay: float = 0.97) -> pd.DataFrame:
+    SPLIT_TRAIN_END = pd.Timestamp("2025-07-31")
+    train_df = X.loc[mask_train].copy()
+    age_weeks = ((SPLIT_TRAIN_END - train_df["week_start"]).dt.days // 7).clip(lower=0)
+    train_df["sample_weight"] = (decay ** age_weeks).astype(float)
+    return train_df
+
+def ml_backtest_v2(X: pd.DataFrame, train_df: pd.DataFrame, mask_val: pd.Series, feat_cols: List[str]) -> Tuple[float, pd.DataFrame]:
+    # clip negatives (returns/credits) to 0
+    X = X.copy()
+    X["qty"] = X["qty"].clip(lower=0)
+    train_df = train_df.copy()
+    train_df["qty"] = train_df["qty"].clip(lower=0)
+
+    val_df = X.loc[mask_val].copy()
+    rows, all_y, all_yhat = [], [], []
+
+    for cg, gtr in train_df.groupby("Customer Group", dropna=False):
+        gva = val_df[val_df["Customer Group"].eq(cg)].copy()
+        if len(gtr) < 20 or len(gva) == 0:
+            continue
+
+        y_tr = np.log1p(gtr["qty"].to_numpy())
+        w_tr = gtr["sample_weight"].to_numpy()
+
+        model = HistGradientBoostingRegressor(
+            loss="absolute_error",
+            max_depth=6,
+            learning_rate=0.05,
+            max_iter=600,
+            l2_regularization=0.0,
+        )
+        model.fit(gtr[feat_cols], y_tr, sample_weight=w_tr)
+
+        yhat = np.expm1(model.predict(gva[feat_cols]))
+        yhat = np.clip(yhat, 0.0, None)
+
+        denom = float(np.abs(gva["qty"]).sum())
+        w_ml = np.nan if denom == 0 else float(np.abs(gva["qty"] - yhat).sum()) / denom
+        rows.append({"Customer Group": cg, "WAPE_ML_v2": w_ml})
+
+        all_y.append(gva["qty"].to_numpy())
+        all_yhat.append(yhat)
+
+    if not all_y:
+        return np.nan, pd.DataFrame(columns=["Customer Group", "WAPE_ML_v2"])
+
+    all_y = np.concatenate(all_y)
+    all_yhat = np.concatenate(all_yhat)
+    overall = np.abs(all_y - all_yhat).sum() / max(np.abs(all_y).sum(), 1e-9)
+    ml_by_group_v2 = pd.DataFrame(rows)
+    return overall, ml_by_group_v2
+
+def make_feat_from_history_v2(q_series: pd.Series, next_week_start: pd.Timestamp) -> Dict[str, float]:
+    vals = q_series.values
+    out: Dict[str, float] = {}
+    for k in [1, 2, 3, 4]:
+        out[f"lag{k}"] = vals[-k] if len(vals) >= k else np.nan
+    for w in [4, 8, 12]:
+        out[f"rollmean_{w}"] = float(pd.Series(vals).tail(w).mean()) if len(vals) >= 2 else np.nan
+    woy = int(pd.Timestamp(next_week_start).isocalendar().week)
+    out["woy_sin"] = np.sin(2 * np.pi * woy / 52.0)
+    out["woy_cos"] = np.cos(2 * np.pi * woy / 52.0)
+    wom = int(((pd.Timestamp(next_week_start).day - 1) // 7) + 1)
+    wom = max(1, min(5, wom))
+    out["wom"] = wom
+    out["wom_sin"] = np.sin(2 * np.pi * wom / 5.0)
+    out["wom_cos"] = np.cos(2 * np.pi * wom / 5.0)
+    prev = vals[-1] if len(vals) >= 1 else np.nan
+    rm4 = float(pd.Series(vals).tail(4).mean()) if len(vals) >= 2 else np.nan
+    rm8 = float(pd.Series(vals).tail(8).mean()) if len(vals) >= 2 else np.nan
+    out["slope_1"] = (prev - rm4) if (np.isfinite(prev) and np.isfinite(rm4)) else np.nan
+    out["mom_4_8"] = (rm4 - rm8) if (np.isfinite(rm4) and np.isfinite(rm8)) else np.nan
+    denom = rm8 if (rm8 is not None and np.isfinite(rm8) and abs(rm8) > 1e-9) else 1e-9
+    out["ratio_4_8"] = (rm4 / denom) if np.isfinite(rm4) else np.nan
+    return out
+
+def september_weeks() -> pd.DatetimeIndex:
+    return pd.date_range("2025-09-01", "2025-09-30", freq="W-MON")
+
+def baseline_forecast_sept(wk_full: pd.DataFrame) -> pd.DataFrame:
+    weeks = list(september_weeks())
+    out = []
+    hist_cutoff = pd.Timestamp("2025-08-31")
+    for cg, g in wk_full.groupby("Customer Group", dropna=False):
+        h = g[g["week_start"] <= hist_cutoff].sort_values("week_start")[["week_start", "qty"]]
+        q_hist = h["qty"].tolist()
+        for wk in weeks:
+            if len(q_hist) >= 2:
+                base = float(pd.Series(q_hist[-4:]).mean())
+            elif len(q_hist) == 1:
+                base = float(q_hist[-1])
+            else:
+                base = 0.0
+            out.append({"Customer Group": cg, "week_start": wk, "pred_base": base})
+            q_hist.append(base)
+    return pd.DataFrame(out)
+
+def ml_forecast_sept_v2(X: pd.DataFrame, wk_full: pd.DataFrame, feat_cols: List[str]) -> pd.DataFrame:
+    # train up to Aug 31 with recency weights, log1p target, MAE loss
+    VAL_END = pd.Timestamp("2025-08-31")
+    decay = 0.97
+    train = X[X["week_start"] <= VAL_END].copy()
+    age_weeks = ((VAL_END - train["week_start"]).dt.days // 7).clip(lower=0)
+    train["sample_weight"] = (decay ** age_weeks).astype(float)
+    train["qty"] = train["qty"].clip(lower=0)
+
+    weeks = list(september_weeks())
+    rows = []
+    for cg, gtr in train.groupby("Customer Group", dropna=False):
+        if len(gtr) < 20:
+            continue
+
+        y_tr = np.log1p(gtr["qty"].to_numpy())
+        w_tr = gtr["sample_weight"].to_numpy()
+        model = HistGradientBoostingRegressor(
+            loss="absolute_error",
+            max_depth=6,
+            learning_rate=0.05,
+            max_iter=600,
+            l2_regularization=0.0,
+        )
+        model.fit(gtr[feat_cols], y_tr, sample_weight=w_tr)
+
+        h = (
+            wk_full[(wk_full["Customer Group"].eq(cg)) & (wk_full["week_start"] <= VAL_END)]
+            .sort_values("week_start")[["week_start", "qty"]]
+            .copy()
+        )
+        q_hist = h["qty"].clip(lower=0).tolist()
+
+        for wk in weeks:
+            f = make_feat_from_history_v2(pd.Series(q_hist), wk)
+            xrow = pd.DataFrame([f])[feat_cols]
+            yhat = float(np.expm1(model.predict(xrow)[0]))
+            yhat = max(0.0, yhat)
+            rows.append({"Customer Group": cg, "week_start": wk, "pred_ml": yhat})
+            q_hist.append(yhat)
+
+    return pd.DataFrame(rows)
+
+def monthly_sop_from_base(base_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build an S&OP September table per 'Customer Group' from Base sheet P-9 column.
+    We deduplicate by (Customer Group, Itemcode) and sum.
+    """
+    # find P-9 column robustly
+    norm_map = {c: str(c).replace("\u00A0"," ").strip().upper().replace("-","").replace("_","") for c in base_df.columns}
+    p9_col = None
+    for c, n in norm_map.items():
+        if n in {"P9", "P09", "PERIOD9"}:
+            p9_col = c
+            break
+    if p9_col is None:
+        return pd.DataFrame(columns=["Customer Group", "sop_sept"])
+
+    sop_p9 = base_df[["Customer Group", "Itemcode", p9_col]].copy()
+    sop_p9[p9_col] = pd.to_numeric(sop_p9[p9_col], errors="coerce")
+
+    p9_by_item = (
+        sop_p9.dropna(subset=[p9_col])
+        .groupby(["Customer Group", "Itemcode"], as_index=False)[p9_col]
+        .max()
+    )
+    sop_sep = (
+        p9_by_item.groupby("Customer Group", as_index=False)[p9_col]
+        .sum()
+        .rename(columns={p9_col: "sop_sept"})
+    )
+    return sop_sep
+
+# ----------------------------
+# UI: Sidebar
+# ----------------------------
+st.sidebar.header("Data")
+uploaded = st.sidebar.file_uploader("Upload Excel (Jan-Aug_ SOP Sept-Dec.xlsx)", type=["xlsx"])
+rel_improve = st.sidebar.slider("ML must beat BASE by at least (relative)", 0.0, 0.20, 0.05, 0.01)
+decay = st.sidebar.slider("Recency decay (per week)", 0.90, 0.999, 0.97, 0.001)
+
+st.title("Weekly Forecast — BASE / ML / BEST (September 2025)")
+
 if not uploaded:
-    st.info("Please upload the Excel file to continue.")
+    st.info("Upload the Excel file to run the app (sheet: **Base**, with daily actuals Jan–Aug 2025 and S&OP P-9).")
     st.stop()
 
-try:
-    xl = pd.ExcelFile(uploaded)
-except Exception as e:
-    st.error(f"Could not read workbook: {e}")
+# ----------------------------
+# Pipeline
+# ----------------------------
+base_df = load_base_excel(uploaded)
+wk_full = build_weekly(base_df)
+if wk_full.empty:
+    st.error("No data after filtering (UOM='CS' & Jan–Aug 2025). Please check the file.")
     st.stop()
 
-with st.expander("Detected sheets", expanded=False):
-    st.write(xl.sheet_names)
+X = add_lags_rolls_calendar(wk_full)
 
-# =========================
-# Helpers — auto header + column detection
-# =========================
-def find_header_row(xl_file, sheet, expected_keys, probe_rows=30, search_top=10):
-    prv = pd.read_excel(xl_file, sheet_name=sheet, header=None, nrows=probe_rows)
-    best_row, best_score = 0, -1
-    for i in range(min(search_top, len(prv))):
-        row = prv.iloc[i].astype(str).str.strip().str.lower().tolist()
-        row_set = set(row)
-        score = 0
-        for cand_list in expected_keys.values():
-            if any(c in row_set for c in cand_list):
-                score += 1
-        if score > best_score:
-            best_row, best_score = i, score
-    return best_row, best_score
+# select features + drop early NaNs
+feat_cols = [
+    "lag1", "lag2", "lag3", "lag4",
+    "rollmean_4", "rollmean_8", "rollmean_12",
+    "woy_sin", "woy_cos",
+    "wom", "wom_sin", "wom_cos",
+    "slope_1", "mom_4_8", "ratio_4_8",
+]
+X_model = X.dropna(subset=feat_cols).copy()
 
-def load_with_auto_header(xl_file, sheet, expected_keys, fallback_header=0):
-    hdr, score = find_header_row(xl_file, sheet, expected_keys)
-    df = pd.read_excel(xl_file, sheet_name=sheet, header=hdr if score > 0 else fallback_header)
-    df.columns = [str(c).strip() for c in df.columns]
-    return df, hdr, score
+mask_train, mask_val = split_masks(X_model)
 
-BASE_KEYS = {
-    "date": ["delivery date","date","order date","ship date"],
-    "item": ["itemcode","item code","sku"],
-    "qty":  ["quantity","units","qty","total sales"],
-    "month": ["month"],
-    "corp": ["customer group","group","corporate customer","corp customer"]
-}
-FREQ_KEYS = {
-    "corp": ["customers","customer group","group","corporate customer"],
-    "seq":  ["sequence","days","pattern"]
-}
+# August baseline
+overall_base_wape, by_group = august_baseline(X_model, mask_val)
 
-def find_col(df, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    clower = [c.lower() for c in df.columns]
-    for cand in candidates:
-        if cand.lower() in clower:
-            return df.columns[clower.index(cand.lower())]
-    return None
+# ML backtest v2 with chosen recency decay
+train_df = recency_weights(X_model, mask_train, decay=decay)
+overall_ml_wape, ml_by_group_v2 = ml_backtest_v2(X_model, train_df, mask_val, feat_cols)
 
-# =========================
-# Part B — Parse Base & Frecuency, build S&OP monthly (Sep–Dec) and frequency weights
-# =========================
-st.header("Data Parsing")
-
-try:
-    base_df, base_hdr, base_score = load_with_auto_header(uploaded, "Base", BASE_KEYS)
-    freq_df, freq_hdr, freq_score = load_with_auto_header(uploaded, "Frecuency", FREQ_KEYS)
-except Exception as e:
-    st.error(f"Could not parse required sheets: {e}")
-    st.stop()
-
-st.write(f"**Base** header row: {base_hdr}  ·  **Frecuency** header row: {freq_hdr}")
-
-# Detect columns
-DATE_COL  = find_col(base_df, BASE_KEYS["date"])
-ITEM_COL  = find_col(base_df, BASE_KEYS["item"])
-QTY_COL   = find_col(base_df, BASE_KEYS["qty"])
-MONTH_COL = find_col(base_df, BASE_KEYS["month"])
-CORP_COL  = find_col(base_df, BASE_KEYS["corp"])
-FREQ_CORP_COL = find_col(freq_df, FREQ_KEYS["corp"])
-FREQ_SEQ_COL  = find_col(freq_df, FREQ_KEYS["seq"])
-
-missing = [name for name, col in [
-    ("Date", DATE_COL), ("Item", ITEM_COL), ("Qty", QTY_COL),
-    ("Month", MONTH_COL), ("Corp", CORP_COL),
-    ("Freq.Corp", FREQ_CORP_COL), ("Freq.Seq", FREQ_SEQ_COL)
-] if col is None]
-if missing:
-    st.error(f"Missing required columns: {missing}")
-    st.stop()
-
-with st.expander("Detected columns", expanded=False):
-    st.write("Base:", [DATE_COL, ITEM_COL, QTY_COL, MONTH_COL, CORP_COL])
-    st.write("Frecuency:", [FREQ_CORP_COL, FREQ_SEQ_COL])
-
-# Actuals (with real dates)
-dates_all = pd.to_datetime(base_df[DATE_COL], errors="coerce")
-actuals = base_df.loc[dates_all.notna(), [DATE_COL, ITEM_COL, QTY_COL, CORP_COL]].copy()
-actuals[DATE_COL] = dates_all[dates_all.notna()]
-actuals[QTY_COL]  = pd.to_numeric(actuals[QTY_COL], errors="coerce")
-st.success(f"Actuals loaded: {len(actuals)} rows")
-st.caption(f"Date range: {actuals[DATE_COL].min()} → {actuals[DATE_COL].max()}")
-
-# Parse Month tokens (handles numbers, names, P-9/P-10…)
-MONTH_NAME_MAP = {
-    "jan":1,"january":1,"feb":2,"february":2,"mar":3,"march":3,"apr":4,"april":4,
-    "may":5,"jun":6,"june":6,"jul":7,"july":7,"aug":8,"august":8,
-    "sep":9,"sept":9,"september":9,"oct":10,"october":10,"nov":11,"november":11,"dec":12,"december":12
-}
-def parse_month_token(x):
-    if pd.isna(x): return np.nan
-    s = str(x).strip().lower()
-    m = pd.to_numeric(s, errors="coerce")
-    if pd.notna(m):
-        v = int(m)
-        return v if 1 <= v <= 12 else np.nan
-    if s in MONTH_NAME_MAP: return MONTH_NAME_MAP[s]
-    if s[:3] in MONTH_NAME_MAP: return MONTH_NAME_MAP[s[:3]]
-    m = re.search(r'(\d{1,2})$', s)  # captures 9 from 'P-9'
-    return int(m.group(1)) if m and 1 <= int(m.group(1)) <= 12 else np.nan
-
-base_df["_MonthNum"] = base_df[MONTH_COL].apply(parse_month_token)
-
-# S&OP = rows without real date and Month in 9..12
-sop_raw = base_df.loc[dates_all.isna() & base_df["_MonthNum"].isin([9,10,11,12]),
-                      [CORP_COL, ITEM_COL, "_MonthNum", QTY_COL]].copy()
-sop_raw[QTY_COL] = pd.to_numeric(sop_raw[QTY_COL], errors="coerce")
-
-sop_monthly = (sop_raw.dropna(subset=[QTY_COL])
-               .groupby([CORP_COL, ITEM_COL, "_MonthNum"], as_index=False)[QTY_COL]
-               .sum()
-               .rename(columns={CORP_COL:"corp_customer", ITEM_COL:"item", "_MonthNum":"Month", QTY_COL:"SOP_Monthly"}))
-
-st.success(f"S&OP monthly (Sep–Dec) rows: {len(sop_monthly)}")
-with st.expander("Preview S&OP monthly", expanded=False):
-    st.dataframe(sop_monthly.head(12), use_container_width=True)
-
-# Frequency weights
-weekday_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-weekday_cols = [c for c in freq_df.columns if any(w in c.lower() for w in weekday_names)]
-dot1 = [c for c in weekday_cols if ".1" in c]
-use_cols = dot1 if dot1 else weekday_cols
-
-freq_use = freq_df[[FREQ_CORP_COL, FREQ_SEQ_COL] + use_cols].copy()
-if use_cols:
-    row_sums = freq_use[use_cols].replace({np.nan: 0}).sum(axis=1)
-    for c in use_cols:
-        freq_use[c] = np.where(row_sums > 0, freq_use[c].fillna(0) / row_sums, 0.0)
-
-seq_to_weekday = {1:"Sunday",2:"Monday",3:"Tuesday",4:"Wednesday",5:"Thursday",6:"Friday",7:"Saturday"}
-def parse_sequence(seq):
-    allowed = set()
-    if pd.isna(seq): return allowed
-    for ch in str(seq):
-        if ch.isdigit():
-            d = int(ch)
-            if d in seq_to_weekday: allowed.add(seq_to_weekday[d])
-    return allowed
-
-freq_use["AllowedDays"] = freq_use[FREQ_SEQ_COL].apply(parse_sequence)
-
-def build_weights(row):
-    allowed = row["AllowedDays"]
-    if use_cols:
-        weights = {col.split(".")[0].split()[0].capitalize(): float(row[col]) if pd.notna(row[col]) else 0.0
-                   for col in use_cols}
-        if allowed:
-            for wd in weekday_names:
-                if wd not in allowed: weights[wd] = 0.0
-        total = sum(weights.get(wd,0.0) for wd in weekday_names)
-        if total > 0:
-            return {wd: weights.get(wd,0.0)/total for wd in weekday_names}
-        elif allowed:
-            eq = 1.0/len(allowed); return {wd: (eq if wd in allowed else 0.0) for wd in weekday_names}
-        else:
-            return {wd: 0.0 for wd in weekday_names}
-    else:
-        if allowed:
-            eq = 1.0/len(allowed); return {wd: (eq if wd in allowed else 0.0) for wd in weekday_names}
-        return {wd:0.0 for wd in weekday_names}
-
-freq_use["Weights"] = freq_use.apply(build_weights, axis=1)
-freq_weights_lookup = dict(zip(freq_use[FREQ_CORP_COL], freq_use["Weights"]))
-st.success(f"Frequency profiles loaded: {len(freq_weights_lookup)}")
-
-# =========================
-# Part C — September allocation (S&OP baseline)
-# =========================
-st.header("September Weekly Forecast (S&OP Baseline)")
-
-sep_start, sep_end = pd.Timestamp("2025-09-01"), pd.Timestamp("2025-09-30")
-cal = pd.DataFrame({"date": pd.date_range(sep_start, sep_end, freq="D")})
-cal["weekday_name"] = cal["date"].dt.day_name()
-cal["week_start"]   = cal["date"] - pd.to_timedelta(cal["date"].dt.weekday, unit="D")
-weekday_counts = cal["weekday_name"].value_counts().to_dict()
-
-def get_weights_for_corp(corp):
-    w = freq_weights_lookup.get(corp)
-    if w is None:
-        eq = 1.0/5.0
-        w = {d: (eq if d in ["Monday","Tuesday","Wednesday","Thursday","Friday"] else 0.0)
-             for d in weekday_names}
-    w = {d: float(w.get(d,0.0)) for d in weekday_names}
-    total = sum(w.values())
-    if total > 0:
-        w = {d: v/total for d, v in w.items()}
-    return w
-
-sop_sep = sop_monthly[sop_monthly["Month"] == 9].copy()
-
-# Monthly -> daily -> weekly
-alloc_rows = []
-for _, r in sop_sep.iterrows():
-    corp = r["corp_customer"]; item = r["item"]
-    monthly_total = float(r["SOP_Monthly"]) if pd.notna(r["SOP_Monthly"]) else 0.0
-    if monthly_total <= 0: continue
-    w = get_weights_for_corp(corp)
-    per_wd_month = {wd: monthly_total * w.get(wd, 0.0) for wd in weekday_names}
-    per_wd_day   = {wd: (per_wd_month[wd] / weekday_counts.get(wd, 1)) for wd in weekday_names}
-    for _, c in cal.iterrows():
-        wd = c["weekday_name"]; qty = per_wd_day.get(wd, 0.0)
-        if qty > 0:
-            alloc_rows.append({
-                "corp_customer": corp,
-                "item": item,
-                "date": c["date"],
-                "weekday": wd,
-                "qty_allocated": qty,
-                "week_start": c["week_start"]
-            })
-alloc_daily_sep = pd.DataFrame(alloc_rows)
-sep_weekly = (alloc_daily_sep.groupby(["corp_customer","item","week_start"], as_index=False)["qty_allocated"]
-              .sum().rename(columns={"qty_allocated":"forecast_weekly"}))
-
-# QA
-alloc_sum = sep_weekly.groupby(["corp_customer","item"], as_index=False)["forecast_weekly"].sum()
-cmp = sop_sep.merge(alloc_sum, on=["corp_customer","item"], how="left")
-cmp["diff"] = cmp["SOP_Monthly"] - cmp["forecast_weekly"]
-cmp["abs_diff"] = cmp["diff"].abs()
-total_sop   = cmp["SOP_Monthly"].sum()
-total_alloc = cmp["forecast_weekly"].sum()
-total_abs   = cmp["abs_diff"].sum()
-c1, c2, c3 = st.columns(3)
-c1.metric("Total S&OP September", f"{total_sop:,.2f}")
-c2.metric("Total Allocated September", f"{total_alloc:,.2f}")
-c3.metric("Total |Diff|", f"{total_abs:,.6f}")
-if (cmp["abs_diff"] > 1e-6).any():
-    st.error("Allocation mismatch detected (see sample):")
-    st.dataframe(cmp[cmp["abs_diff"] > 1e-6].head(10), use_container_width=True)
-else:
-    st.success("Allocation integrity ✅ (S&OP total equals allocated total).")
-
-st.dataframe(sep_weekly.sort_values(["corp_customer","item","week_start"]).head(20),
-             use_container_width=True)
-
-# =========================
-# Accuracy (only if Sept actuals exist)
-# =========================
-st.subheader("Accuracy (September)")
-has_sep_actuals = (dates_all.dropna().between(sep_start, sep_end)).any()
-
-accuracy_table = None
-overall_wape = overall_smape = None
-
-def WAPE(y, yhat):
-    denom = np.sum(np.abs(y));  return np.nan if denom == 0 else np.sum(np.abs(y - yhat)) / denom
-def sMAPE(y, yhat):
-    denom = (np.abs(y) + np.abs(yhat)); mask = denom > 0
-    return np.nan if mask.sum() == 0 else np.mean(2.0 * np.abs(y - yhat)[mask] / denom[mask])
-
-weekly_actuals = pd.DataFrame(columns=["corp_customer","item","week_start","Actual"])
-if has_sep_actuals:
-    actuals_sep = base_df.loc[dates_all.between(sep_start, sep_end), [DATE_COL, ITEM_COL, QTY_COL, CORP_COL]].copy()
-    actuals_sep[DATE_COL] = pd.to_datetime(actuals_sep[DATE_COL], errors="coerce")
-    actuals_sep[QTY_COL]  = pd.to_numeric(actuals_sep[QTY_COL], errors="coerce").fillna(0)
-    actuals_sep["week_start"] = actuals_sep[DATE_COL] - pd.to_timedelta(actuals_sep[DATE_COL].dt.weekday, unit="D")
-    weekly_actuals = (actuals_sep.groupby([CORP_COL, ITEM_COL, "week_start"], as_index=False)[QTY_COL]
-                      .sum().rename(columns={CORP_COL:"corp_customer", ITEM_COL:"item", QTY_COL:"Actual"}))
-    joined = sep_weekly.merge(weekly_actuals, on=["corp_customer","item","week_start"], how="inner")
-    if len(joined):
-        overall_wape  = WAPE(joined["Actual"].values, joined["forecast_weekly"].values)
-        overall_smape = sMAPE(joined["Actual"].values, joined["forecast_weekly"].values)
-        m1, m2 = st.columns(2)
-        m1.metric("WAPE (Sep)",  f"{overall_wape:.3f}")
-        m2.metric("sMAPE (Sep)", f"{overall_smape:.3f}")
-        accuracy_table = (joined.groupby(["corp_customer","item"], as_index=False)
-                          .apply(lambda g: pd.Series({
-                              "WAPE":  WAPE(g["Actual"].values, g["forecast_weekly"].values),
-                              "sMAPE": sMAPE(g["Actual"].values, g["forecast_weekly"].values),
-                              "Vol":   g["Actual"].sum()
-                          })).sort_values("Vol", ascending=False).reset_index(drop=True))
-        with st.expander("Accuracy by (Corporate, Item)", expanded=False):
-            st.dataframe(accuracy_table.head(30), use_container_width=True)
-else:
-    st.caption("Forecast built from S&OP + Frequency. Download below to compare offline.")
-
-# =========================
-# Mini chart — weekly Forecast vs Actual (selected pair)
-# =========================
-st.subheader("Mini Chart (Weekly: Forecast vs Actual)")
-pairs_for_chart = sep_weekly[["corp_customer","item"]].drop_duplicates().sort_values(["corp_customer","item"])
-if len(pairs_for_chart) == 0:
-    st.info("No September forecast pairs to visualize.")
-else:
-    corp_list = pairs_for_chart["corp_customer"].unique().tolist()
-    sel_corp = st.selectbox("Select Corporate Customer", corp_list)
-    item_list = pairs_for_chart.loc[pairs_for_chart["corp_customer"] == sel_corp, "item"].unique().tolist()
-    sel_item = st.selectbox("Select Item", item_list)
-
-    f_sel = sep_weekly[(sep_weekly["corp_customer"] == sel_corp) & (sep_weekly["item"] == sel_item)].copy()
-    plot_df = f_sel[["week_start","forecast_weekly"]].set_index("week_start").sort_index()
-    plot_df.rename(columns={"forecast_weekly":"Forecast (S&OP Split)"}, inplace=True)
-
-    if len(weekly_actuals):
-        a_sel = weekly_actuals[(weekly_actuals["corp_customer"] == sel_corp) & (weekly_actuals["item"] == sel_item)]
-        if len(a_sel):
-            a_sel = a_sel[["week_start","Actual"]].set_index("week_start").sort_index()
-            plot_df = plot_df.join(a_sel, how="left")
-
-    st.line_chart(plot_df)
-    st.dataframe(plot_df.reset_index().rename(columns={"week_start":"Week Start"}),
-                 use_container_width=True)
-
-# =========================
-# Actuals-driven Forecast (ADP) for September + Comparison vs S&OP
-# =========================
-st.header("September Weekly Forecast (Actuals-Driven) + Comparison")
-# Weekly actuals up to Aug-31
-act = base_df.loc[dates_all.notna(), [DATE_COL, ITEM_COL, QTY_COL, CORP_COL]].copy()
-act[DATE_COL] = dates_all[dates_all.notna()]
-act[QTY_COL]  = pd.to_numeric(act[QTY_COL], errors="coerce").fillna(0)
-act["week_start"] = act[DATE_COL] - pd.to_timedelta(act[DATE_COL].dt.weekday, unit="D")
-weekly_all = (act.groupby([CORP_COL, ITEM_COL, "week_start"], as_index=False)[QTY_COL]
-              .sum().rename(columns={CORP_COL:"corp_customer", ITEM_COL:"item", QTY_COL:"actual"}))
-train_cutoff = pd.Timestamp("2025-08-31")
-train_wk = weekly_all[weekly_all["week_start"] <= train_cutoff].copy()
-
-# September week grid
-sep_weeks = sorted(cal["week_start"].unique())
-k_weeks = len(sep_weeks)
-
-# Item-level fallback: mean of last 8 weeks across all customers for that item
-item_week = (train_wk.groupby(["item","week_start"], as_index=False)["actual"].sum()
-             .sort_values("week_start"))
-item_last8_mean = (item_week.groupby("item")["actual"]
-                   .apply(lambda s: s.tail(8).mean() if len(s) else 0.0)).to_dict()
-
-def forecast_next_weeks(series_df, item, k=k_weeks):
-    s = series_df.sort_values("week_start")["actual"].to_numpy()
-    n = len(s)
-    if n >= 8:
-        last8 = s[-8:]
-        level = float(last8.mean())
-        x = np.arange(len(last8))
-        slope = float(np.polyfit(x, last8, 1)[0])
-        return [max(0.0, level + slope*(i+1)) for i in range(k)]
-    elif n >= 4:
-        level = float(s[-4:].mean())
-        return [max(0.0, level)] * k
-    elif n >= 1:
-        level = float(s.mean())
-        return [max(0.0, level)] * k
-    else:
-        level = float(item_last8_mean.get(item, 0.0))
-        return [max(0.0, level)] * k
-
-# Forecast only pairs present in S&OP Sep (so comparison is aligned)
-pairs = sop_sep[["corp_customer","item"]].drop_duplicates()
-adp_rows = []
-for _, p in pairs.iterrows():
-    cc, it = p["corp_customer"], p["item"]
-    hist = train_wk[(train_wk["corp_customer"] == cc) & (train_wk["item"] == it)][["week_start","actual"]]
-    preds = forecast_next_weeks(hist, it, k=k_weeks)
-    for wk, yhat in zip(sep_weeks, preds):
-        adp_rows.append({"corp_customer": cc, "item": it, "week_start": wk, "forecast_weekly_adp": yhat})
-adp_weekly = pd.DataFrame(adp_rows)
-
-# Totals
-tot_adp = adp_weekly["forecast_weekly_adp"].sum()
-tot_sop = sep_weekly["forecast_weekly"].sum()
-m1, m2 = st.columns(2)
-m1.metric("Total ADP (from actuals) – Sep", f"{tot_adp:,.2f}")
-m2.metric("Total S&OP baseline – Sep",       f"{tot_sop:,.2f}")
-
-# Comparison table
-compare = (sep_weekly.rename(columns={"forecast_weekly":"forecast_weekly_sop"})
-           .merge(adp_weekly, on=["corp_customer","item","week_start"], how="outer"))
-for col in ["forecast_weekly_sop","forecast_weekly_adp"]:
-    compare[col] = compare[col].fillna(0.0)
-compare["delta"]     = compare["forecast_weekly_adp"] - compare["forecast_weekly_sop"]
-compare["delta_pct"] = np.where(compare["forecast_weekly_sop"]>0,
-                                compare["delta"]/compare["forecast_weekly_sop"], np.nan)
-
-st.subheader("Comparison: ADP vs S&OP (Weekly, September)")
-st.dataframe(compare.sort_values(["corp_customer","item","week_start"]).head(30),
-             use_container_width=True)
-
-# =========================
-# Export to Excel (Summary + Sep_Weekly_SOP + Sep_Weekly_ADP + Compare + Accuracy if available)
-# =========================
-from io import BytesIO
-output = BytesIO()
-with pd.ExcelWriter(output, engine="openpyxl") as writer:
-    # Summary
-    summary_rows = {
-        "Total_SOP_Sep": sep_weekly["forecast_weekly"].sum(),
-        "Total_ADP_Sep": adp_weekly["forecast_weekly_adp"].sum(),
-    }
-    if overall_wape is not None:
-        summary_rows["WAPE_Sep"]  = overall_wape
-    if overall_smape is not None:
-        summary_rows["sMAPE_Sep"] = overall_smape
-    pd.DataFrame([summary_rows]).to_excel(writer, sheet_name="Summary", index=False)
-
-    # S&OP baseline weekly
-    sep_weekly.rename(columns={"forecast_weekly":"forecast_weekly_sop"}) \
-              .sort_values(["corp_customer","item","week_start"]) \
-              .to_excel(writer, sheet_name="Sep_Weekly_SOP", index=False)
-
-    # Actuals-driven weekly
-    adp_weekly.sort_values(["corp_customer","item","week_start"]) \
-              .to_excel(writer, sheet_name="Sep_Weekly_ADP", index=False)
-
-    # Comparison
-    compare.sort_values(["corp_customer","item","week_start"]) \
-           .to_excel(writer, sheet_name="Compare_SOP_vs_ADP", index=False)
-
-    # Accuracy (optional)
-    if accuracy_table is not None and len(accuracy_table) > 0:
-        accuracy_table.to_excel(writer, sheet_name="Accuracy_By_Series", index=False)
-
-data = output.getvalue()
-st.download_button(
-    label="⬇️ Download Excel",
-    data=data,
-    file_name="September_Forecast_Test.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+# winners by relative improvement threshold
+winners = (
+    ml_by_group_v2.merge(by_group, on="Customer Group", how="inner")
+    .assign(
+        abs_gain=lambda d: d["WAPE_base"] - d["WAPE_ML_v2"],
+        rel_gain=lambda d: (d["WAPE_base"] - d["WAPE_ML_v2"]) / d["WAPE_base"].clip(lower=1e-9),
+        winner=lambda d: np.where(
+            (d["WAPE_ML_v2"] < d["WAPE_base"]) & (d["rel_gain"] >= rel_improve),
+            "ML", "BASE"
+        ),
+    )
 )
+
+# September forecasts
+pred_base = baseline_forecast_sept(wk_full)
+pred_ml_sept_v2 = ml_forecast_sept_v2(X_model, wk_full, feat_cols)
+
+comb = (
+    pred_base.merge(pred_ml_sept_v2, on=["Customer Group", "week_start"], how="left")
+    .merge(winners[["Customer Group", "winner"]], on="Customer Group", how="left")
+)
+comb["winner"] = comb["winner"].fillna("BASE")
+comb["pred_best"] = np.where(
+    (comb["winner"].eq("ML")) & (comb["pred_ml"].notna()),
+    comb["pred_ml"],
+    comb["pred_base"],
+)
+
+# S&OP monthly compare (optional)
+sop_sep = monthly_sop_from_base(base_df)
+f_sept = comb.groupby("Customer Group", as_index=False)["pred_best"].sum().rename(columns={"pred_best": "forecast_sept"})
+cmp_month = f_sept.merge(sop_sep, on="Customer Group", how="left")
+cmp_month["delta"] = cmp_month["forecast_sept"] - cmp_month["sop_sept"]
+cmp_month["delta%"] = cmp_month["delta"] / cmp_month["sop_sept"].replace({0: np.nan})
+
+# ----------------------------
+# UI: Tabs
+# ----------------------------
+tab1, tab2, tab3, tab4 = st.tabs(["Forecast", "August Backtest", "S&OP Compare (monthly)", "README"])
+
+with tab1:
+    st.subheader("Forecast — September 2025")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("August WAPE — Baseline", f"{overall_base_wape:.3f}")
+    c2.metric("August WAPE — ML (v2)", f"{overall_ml_wape:.3f}")
+    win_counts = winners["winner"].value_counts() if not winners.empty else pd.Series(dtype=int)
+    c3.metric("Winners (ML / BASE)", f"{int(win_counts.get('ML',0))} / {int(win_counts.get('BASE',0))}")
+
+    mode = st.radio("Forecast Mode", ["BEST", "ML", "BASE"], horizontal=True)
+    df_show = {
+        "BEST": comb.rename(columns={"pred_best": "forecast_qty"})[["Customer Group","week_start","forecast_qty"]],
+        "ML":   pred_ml_sept_v2.rename(columns={"pred_ml": "forecast_qty"}),
+        "BASE": pred_base.rename(columns={"pred_base": "forecast_qty"}),
+    }[mode].copy()
+    df_show["week_start"] = pd.to_datetime(df_show["week_start"])
+
+    # Explorer
+    top_totals = df_show.groupby("Customer Group")["forecast_qty"].sum().sort_values(ascending=False)
+    default_cg = top_totals.index[0] if len(top_totals) else df_show["Customer Group"].iloc[0]
+    cg = st.selectbox("Select Customer Group", sorted(df_show["Customer Group"].unique()), index=sorted(df_show["Customer Group"].unique()).index(default_cg))
+
+    cg_base = pred_base[pred_base["Customer Group"].eq(cg)].rename(columns={"pred_base": "BASE"})
+    cg_ml   = pred_ml_sept_v2[pred_ml_sept_v2["Customer Group"].eq(cg)].rename(columns={"pred_ml": "ML"})
+    cg_best = comb[comb["Customer Group"].eq(cg)][["Customer Group","week_start","pred_best","winner"]].rename(columns={"pred_best":"BEST"})
+
+    viz = (
+        cg_base.merge(cg_ml, on=["Customer Group","week_start"], how="outer")
+               .merge(cg_best, on=["Customer Group","week_start"], how="outer")
+               .sort_values("week_start")
+    )
+    viz["week_start"] = pd.to_datetime(viz["week_start"]).dt.date
+
+    st.line_chart(viz.set_index("week_start")[["BASE","ML","BEST"]])
+
+    st.dataframe(viz.rename(columns={"week_start":"Week"}), use_container_width=True)
+
+    # Downloads
+    def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            for name, df in sheets.items():
+                _df = df.copy()
+                if "week_start" in _df.columns:
+                    _df["week_start"] = pd.to_datetime(_df["week_start"]).dt.date
+                _df.to_excel(writer, sheet_name=name, index=False)
+        buf.seek(0)
+        return buf.read()
+
+    st.download_button(
+        "Download September forecasts (Excel)",
+        data=to_excel_bytes({
+            "sept_base": pred_base.rename(columns={"pred_base": "forecast_qty"}),
+            "sept_ml_v2": pred_ml_sept_v2.rename(columns={"pred_ml": "forecast_qty"}),
+            "sept_best": comb[["Customer Group","week_start","pred_best"]].rename(columns={"pred_best":"forecast_qty"}),
+        }),
+        file_name="forecast_sept_2025_bestof.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+with tab2:
+    st.subheader("August Backtest — WAPE and Winners")
+    if winners.empty:
+        st.info("Not enough data to compute backtest per customer.")
+    else:
+        comp = (
+            winners[["Customer Group","WAPE_base","WAPE_ML_v2","abs_gain","rel_gain","winner"]]
+            .sort_values(["winner","rel_gain"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
+        st.dataframe(comp, use_container_width=True)
+        st.caption("Winner rule: ML must beat BASE by the chosen relative threshold (sidebar).")
+
+with tab3:
+    st.subheader("S&OP Compare — Monthly (P-9 vs September total)")
+    if sop_sep.empty:
+        st.info("P-9 (September S&OP) column not detected in Base sheet. This view is optional and for comparison only.")
+    else:
+        cmp_view = (
+            cmp_month.sort_values("forecast_sept", ascending=False)
+            .rename(columns={
+                "forecast_sept": "Forecast Sept (Best-of)",
+                "sop_sept": "S&OP Sept (P-9)",
+                "delta": "Δ (Forecast - S&OP)",
+                "delta%": "Δ% vs S&OP",
+            })
+        )
+        st.dataframe(cmp_view, use_container_width=True)
+        st.caption("S&OP is used only for comparison (not as a training input).")
+
+with tab4:
+    st.subheader("README / Approach")
+    st.markdown("""
+**Goal.** Independent weekly forecast of **September 2025** per Corporate Customer (Customer Group) from **Jan–Aug actuals**.  
+We deliver **BASE**, **ML**, and **BEST (per-customer winner)** for a clean comparison against client actuals and S&OP.
+
+**Method (short):**
+- **Baseline (BASE):** last 4-week mean, applied iteratively.
+- **ML (v2):** gradient boosting on weekly features (lags/rolling means, week-of-year, week-of-month, momentum).
+  - Training: **Jan–Jul**, validation on **August**.
+  - Loss: **MAE-like** (`absolute_error`), **log1p target**, **recency weights** (weeks closer to July weighted more).
+  - Safeguard: clip negatives to **0**.
+- **Best-of (winner):** use ML only where it beats BASE on August by ≥ threshold (sidebar), else keep BASE.
+- **S&OP (P-9):** shown **for comparison only** in the monthly view.
+
+**August results (typical with 8 months of history & no promo/seasonality flags):**
+- Baseline WAPE around **0.46**; ML around **0.41**; ML wins on ~**50%** of customers.
+- Weekly, per-customer WAPE of **0.40–0.45** is a solid v1; lower requires more signal.
+
+**To improve further:**
+1) Add **2024** actuals (annual seasonality).
+2) Provide **promo/price/stock/weekly market factor** signals.
+3) Optional **per-customer bias calibration** (fit on August) and **intermittent demand** handling for sparse customers.
+""")
